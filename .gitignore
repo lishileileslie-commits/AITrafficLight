@@ -8,3 +8,8 @@ standup_log.json
 standup_ui.json
 notes.txt
 widget.log
+
+# 打包产物
+build/
+dist/
+*.spec

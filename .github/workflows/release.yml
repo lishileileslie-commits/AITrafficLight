@@ -1,0 +1,42 @@
+name: Release
+
+# 打个 tag (如 v0.1.0) 推上去, 就自动构建 exe 并挂到 GitHub Release。
+# 用户下载的是这个 exe: 不需要装 Python, 也不需要手编 settings.json。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:        # 也可以在网页上手动点一次, 用来试构建
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write       # 创建 Release 要写权限
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pillow pyinstaller
+      - name: Build exe
+        run: >
+          pyinstaller --onefile --windowed --name AITrafficLight
+          --hidden-import status_hook --hidden-import onboard app.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AITrafficLight
+          path: dist/AITrafficLight.exe
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/AITrafficLight.exe
+          body: |
+            下载 `AITrafficLight.exe`, 双击运行即可 —— 不需要安装 Python。
+
+            首次运行会问你是否接入 Claude Code (会在 `~/.claude/settings.json` 里加三个 hook,
+            改动前自动备份), 以及是否开机自启。
+
+            **Windows 会弹 "已保护你的电脑"**: 这个 exe 没有代码签名证书 (开源项目买不起),
+            点 "更多信息" -> "仍要运行" 即可。介意的话可以自己从源码构建, 命令就在上面这个
+            工作流文件里。

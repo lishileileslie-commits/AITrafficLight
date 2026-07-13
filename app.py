@@ -15,6 +15,7 @@ AI 红绿灯 —— 桌面悬浮窗 (iOS 玻璃质感版)。
 """
 
 import os
+import sys
 import json
 import time
 import datetime
@@ -40,7 +41,18 @@ CLAUDE_BUSY_MAX_SEC = 1800  # 尾部=该 AI 动(工具在跑/正在生成)却这
 CLAUDE_STALE_SEC = 600      # 尾部读不出来(unknown)时才用的 mtime 兜底。
 
 CREATE_NO_WINDOW = 0x08000000
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "widget.log")
+
+# 数据目录 (日志/计时历史/备注/窗口设置)。打包成 exe 后不能用 __file__: onefile 模式下它指向
+# 每次运行临时解压的目录, 一退出就没了 —— 设置和历史会凭空消失。所以打包版落到 LOCALAPPDATA,
+# 源码版仍放仓库目录 (开发时就地可见, 也不动已有的历史文件)。
+if getattr(sys, "frozen", False):
+    HERE = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                        "AITrafficLight")
+    os.makedirs(HERE, exist_ok=True)
+else:
+    HERE = os.path.dirname(os.path.abspath(__file__))
+
+LOG_FILE = os.path.join(HERE, "widget.log")
 
 
 def log(msg):
@@ -85,7 +97,6 @@ STRIP_ALPHA = 235              # 细边不透明度: 不跟随透明度滑块, �
 # ---------------------------------------------------------------------------
 # UpTime 计时器 + 备注 (原 standup.py, 现合并进同一磨砂玻璃窗口)
 # ---------------------------------------------------------------------------
-HERE = os.path.dirname(os.path.abspath(__file__))
 NOTES_FILE = os.path.join(HERE, "notes.txt")
 STANDUP_LOG_FILE = os.path.join(HERE, "standup_log.json")
 UI_FILE = os.path.join(HERE, "standup_ui.json")
@@ -1320,6 +1331,13 @@ class FloatingWidget:
         self.dock = dk if dk in ("left", "right", "top", "bottom") else None
         self.peeked = False
 
+        # 首次运行把 hook 接进 Claude Code (会弹一次框征求同意); 已接过则静默自愈过时的路径。
+        try:
+            import onboard
+            onboard.run(self.ui_data, lambda: save_json(UI_FILE, self.ui_data))
+        except Exception as e:
+            log("onboard: " + repr(e))               # 接入失败不该拖垮悬浮窗本身
+
         self._wndproc = WNDPROCTYPE(self._on_msg)
         self._edit_wndproc = WNDPROCTYPE(self._edit_proc)
         self.hwnd = self._make_window()
@@ -1966,5 +1984,11 @@ def _single_instance():
 
 
 if __name__ == "__main__":
-    if not _single_instance():
+    # 同一个可执行体兼任 hook: `AITrafficLight.exe --hook green` 就是钩子入口。
+    # 这样打包成单个 exe 之后, 用户机器上不需要 Python, hook 也不用去找 status_hook.py 在哪。
+    if len(sys.argv) > 2 and sys.argv[1] == "--hook":
+        import status_hook
+        sys.argv = [sys.argv[0], sys.argv[2]]
+        status_hook.main()
+    elif not _single_instance():
         FloatingWidget()
