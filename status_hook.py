@@ -74,6 +74,12 @@ TRAIL_FILLER = (
 )
 
 
+# Notification 事件有两种: 真要你处理(等你批权限 / 做抉择), 和"输入框空闲 60 秒了"的提醒。
+# 后者不该点黄灯: 一个已经跑完(红灯)的项目, 你晾它 60 秒就被点成黄, 而此后再没有任何钩子会响,
+# 黄灯就永远挂在那儿 —— 这是黄灯显得特别久的主因。只认前者, 空闲提醒一律不动灯色。
+IDLE_NOTICE = re.compile(r"waiting for your input|is idle|等待.*输入|空闲", re.IGNORECASE)
+
+
 # 元对话 / 闲聊碎片: 抽出来的短语若是这些, 不是"在干的活" -> 拒绝, 守住不回显闲聊。
 META_PREFIX = ("没理解", "不理解", "没明白", "不明白", "没懂", "没听懂", "理解错", "误解",
                "搞错", "弄错", "想错", "记错", "不是说", "刚才说", "你说",
@@ -201,6 +207,9 @@ def main():
         data = json.loads(raw.decode("utf-8", errors="replace")) if raw else {}
     except Exception:
         data = {}
+
+    if status == "yellow" and IDLE_NOTICE.search(str(data.get("message") or "")):
+        sys.exit(0)                                   # 只是"你 60 秒没说话"的提醒, 不是待你处理
 
     cwd = data.get("cwd") or os.getcwd()
     fp = os.path.join(cwd, ".ai-status.json")

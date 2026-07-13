@@ -28,9 +28,16 @@ from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 CODEX_SESSIONS = os.path.join(os.path.expanduser("~"), ".codex", "sessions")
 CODEX_FRESH_SEC = 45   # rollout 文件 mtime 在此秒数内 = Codex 正在该项目干活; Codex 写 rollout 比 Claude 写 transcript 稀疏(每个动作才写一次, 推理/长命令间隔常达数十秒), 窗口太小(旧值 12)会在 Codex 思考时闪红
-CLAUDE_FRESH_SEC = 5   # 文件是 yellow 时: transcript <此秒数动过 = 你已批准、AI 又在跑 -> 顶成绿(别卡在黄)。
-CLAUDE_STALE_SEC = 180 # 文件是 green(回合进行中=AI在思考/运行)时: 只有 transcript 超此秒数彻底没动 = 真正
-                       # "空闲搁置"(会话被丢下、没触发 Stop) -> 红。取值要大, 别把长思考/长命令误判成搁置。
+
+# Claude 的灯色由 transcript 尾部语义(transcript_state: 球在谁手里)决定, 不再拿 mtime 猜"还在不在干活"
+# —— 一条跑十分钟的命令期间 transcript 一个字节都不写, 拿 mtime 判空闲必然把"在跑"误判成红。
+# 下面三个秒数只是兜底, 不参与正常判定。
+CLAUDE_IDLE_GRACE_SEC = 30  # 尾部=回合已结束、文件却还写着绿(Stop 钩子没响的僵尸绿): 再等这么久没动才落红。
+                            # 留余量是因为回合中途 assistant 常先写一条文本、隔几秒才写 tool_use, 那个缝隙
+                            # 里尾部看着就像"回合结束", 别闪红。
+CLAUDE_BUSY_MAX_SEC = 1800  # 尾部=该 AI 动(工具在跑/正在生成)却这么久没写过一个字节 = 会话被杀/窗口被关,
+                            # 没有任何钩子会响 -> 落红, 免得永久绿。
+CLAUDE_STALE_SEC = 600      # 尾部读不出来(unknown)时才用的 mtime 兜底。
 
 CREATE_NO_WINDOW = 0x08000000
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "widget.log")
@@ -435,42 +442,75 @@ def get_open_projects():
     return out
 
 
-def _transcript_fresh(tpath):
-    """Claude 会话 transcript 文件近 CLAUDE_FRESH_SEC 秒内被写过 = AI 正在该项目干活。"""
+def _transcript_age(tpath):
+    """transcript 多久没被写过(秒); 没有文件 -> 无穷大。只用于兜底, 不用于正常判定。"""
     if not tpath:
-        return False
+        return float("inf")
     try:
-        return (time.time() - os.path.getmtime(tpath)) < CLAUDE_FRESH_SEC
+        return time.time() - os.path.getmtime(tpath)
     except OSError:
-        return False
+        return float("inf")
 
 
-def _transcript_stale(tpath, limit=CLAUDE_STALE_SEC):
-    """transcript 超过 limit 秒没动(或压根没有) = Claude 早就不在这项目干活了。
-    没有活动心跳还写着绿 = 会话结束却没触发 Stop 钩子写红, 用它把这种僵尸绿灯落回红。"""
+# 非对话记录(标题/附件/快照/队列/API 报错), 它们随时会追加, 不代表谁在动 -> 找尾部消息时跳过。
+SKIP_RECORDS = ("system", "attachment", "file-history-snapshot",
+                "last-prompt", "ai-title", "queue-operation", "summary")
+TAIL_BYTES = 262144                   # 只读尾部 256KB: 够装下最后几条记录(含大 tool_result), 又不整文件读
+
+
+def _blocks(msg):
+    """消息里的内容块类型集合, 如 {"text", "tool_use", "thinking", "tool_result"}。"""
+    out = set()
+    c = msg.get("content")
+    if isinstance(c, list):
+        for x in c:
+            if isinstance(x, dict):
+                out.add(str(x.get("type") or ""))
+            else:
+                out.add("text")
+    elif c:
+        out.add("text")
+    return out
+
+
+def _msg_text(msg):
+    c = msg.get("content")
+    if isinstance(c, list):
+        parts = []
+        for x in c:
+            if isinstance(x, dict):
+                parts.append(str(x.get("text") or x.get("content") or ""))
+            else:
+                parts.append(str(x))
+        return " ".join(parts)
+    return str(c or "")
+
+
+def transcript_state(tpath):
+    """读 transcript 尾部, 判断"球在谁手里" —— 这才是灯色的真信号。
+    mtime 不是: 一条跑十分钟的命令期间 transcript 一个字节都不写, 拿"多久没动"判空闲, 必然把
+    正在跑长命令的会话误判成红 (amazon 就是这么被打红的)。尾部那条消息则永远是准的:
+
+      "tool" AI 发了 tool_use 但还没有结果回来。两种可能, transcript 里长得一模一样, 靠文件灯色分:
+             文件绿 = 工具正在跑 (跑多久都算在干活); 文件黄 = Notification 说要你批准, 还堵在你这儿。
+      "gen"  尾部是 user 记录 (你的话, 或工具结果回来了) = 球在 AI 手里, 它正在生成。
+      "idle" 尾部是 assistant 纯文本 = 回合已结束, 球在你手里。(只含 thinking 的记录不算结束:
+             思考块永远不会是回合终点, 后面必然还有文本或工具。)
+      "interrupted" 尾部是 "[Request interrupted by user]" = 你按了 Esc。中断不触发任何钩子
+             (Stop 不在中断时触发, 会话也没结束), 文件还停在绿, 只有这个标记能认。再发话它就不在
+             尾部了 -> 自动解除。
+      "unknown" 没文件 / 读不出 / 尾部凑不出一条完整记录 -> 交给 mtime 兜底。
+    """
     if not tpath:
-        return True
-    try:
-        return (time.time() - os.path.getmtime(tpath)) >= limit
-    except OSError:
-        return True
-
-
-def _transcript_interrupted(tpath):
-    """transcript 末尾那条实质消息是否 = "[Request interrupted by user]" = 用户按 Esc 中断了回合。
-    中断不触发任何钩子(官方文档: Stop 不在中断时触发, 会话也没结束故 SessionEnd 也不触发),
-    只在 transcript 尾留这条 user 记录。所以直接读文件尾认这个标记。用户随后再发话会追加新记录,
-    标记不再在末尾 -> 自动解除, 无需任何钩子配合。"""
-    if not tpath:
-        return False
+        return "unknown"
     try:
         with open(tpath, "rb") as f:
             f.seek(0, os.SEEK_END)
             size = f.tell()
-            f.seek(max(0, size - 4096))       # 只读尾部 4KB, 别整文件读
+            f.seek(max(0, size - TAIL_BYTES))
             tail = f.read().decode("utf-8", "replace")
     except OSError:
-        return False
+        return "unknown"
     for line in reversed(tail.splitlines()):
         line = line.strip()
         if not line:
@@ -478,24 +518,24 @@ def _transcript_interrupted(tpath):
         try:
             d = json.loads(line)
         except Exception:
-            continue                          # 末行可能是半截写入; 跳到上一行
+            continue                       # 半截行(读到一半 / 尾部被截断) -> 看上一条
+        if d.get("type") in SKIP_RECORDS:
+            continue
         msg = d.get("message")
         if not isinstance(msg, dict):
-            continue                          # 非消息记录(meta/summary 等)跳过
-        content = msg.get("content")
-        if isinstance(content, list):
-            parts = []
-            for x in content:
-                if isinstance(x, dict):
-                    parts.append(str(x.get("text") or x.get("content") or ""))
-                else:
-                    parts.append(str(x))
-            content = " ".join(parts)
-        text = str(content or "")
-        if not text.strip():
             continue
-        return "[Request interrupted by user" in text   # 末尾第一条实质消息=中断标记?
-    return False
+        if d.get("type") == "assistant":
+            blocks = _blocks(msg)
+            if "tool_use" in blocks:
+                return "tool"
+            if "text" in blocks:
+                return "idle"
+            return "gen"                   # 只有 thinking: 还在生成, 回合没完
+        if d.get("type") == "user":
+            if "[Request interrupted by user" in _msg_text(msg):
+                return "interrupted"
+            return "gen"                   # 你的话 / 工具结果 -> 轮到 AI 动
+    return "unknown"
 
 
 def compact_task(text, limit=TASK_MAX_CHARS, fallback=""):
@@ -1282,36 +1322,45 @@ class FloatingWidget:
                 # 绝不回退到 info["summary"]: Codex 没钩子写 .ai-status.json, 那字段永远是上一个
                 # Claude 会话残留的旧摘要(比如 "继续已完成"), 拿来当 Codex 的活是错的。
                 info["task"] = codex[1] or "Codex 运行中"
-            elif _transcript_interrupted(info.get("_transcript")):
-                # 用户按 Esc 中断了回合: 官方文档明确 Stop 不在中断时触发, 会话也没结束, 没有任何钩子会响,
-                # 文件还停在绿; 只有 transcript 尾巴留了中断标记。认这个标记 -> 红。再发话标记消失, 自动回绿。
-                info = dict(info)
-                core = retint_suffix(info.get("summary") or info.get("task") or "", "red")
-                if core.endswith("已完成"):
-                    core = core[:-3] + "已中断"     # 中断≠完成, 用"已中断"更贴切
-                info["status"] = "red"
-                info["summary"] = info["task"] = core
-            elif info.get("status") == "green":
-                # 文件绿 = 回合进行中 = AI 在思考/运行 -> 绿。短暂不写 transcript(思考、长命令、工具调用
-                # 几十秒没输出)不降级 —— 否则 amazon 一思考就变黄。只有 transcript 超 CLAUDE_STALE_SEC(180s)
-                # 彻底没动 = 真正"空闲搁置"(会话被丢下、没触发 Stop) 才 -> 红。
-                if _transcript_stale(info.get("_transcript"), CLAUDE_STALE_SEC):
+            else:
+                # 钩子写的灯色只是"上一个事件说了什么", 真正现在在不在干活, 看 transcript 尾部谁该动。
+                old = info.get("status")
+                tpath = info.get("_transcript")
+                state = transcript_state(tpath)
+                age = _transcript_age(tpath)
+                new = old
+                if state == "interrupted":
+                    new = "red"                       # 按了 Esc: 不触发任何钩子, 文件还停在绿, 只能认这个标记
+                elif old == "green":
+                    if state in ("tool", "gen"):
+                        # 尾部说球在 AI 手里(工具在跑 / 正在生成) -> 绿, 不管 transcript 多久没写:
+                        # 长命令期间它本来就不写。只有久到像会话被杀(半小时) 才当崩了落红。
+                        new = "red" if age >= CLAUDE_BUSY_MAX_SEC else "green"
+                    elif state == "idle":
+                        # 尾部说回合已结束, 文件却还绿 = Stop 钩子没响的僵尸绿 -> 落红(留一点缝隙余量)。
+                        new = "red" if age >= CLAUDE_IDLE_GRACE_SEC else "green"
+                    else:                             # unknown: 尾部读不出来, 只剩 mtime 可信
+                        new = "red" if age >= CLAUDE_STALE_SEC else "green"
+                elif old == "yellow":
+                    # 黄 = Notification 写的(要你批权限/做抉择)。你批准之后不触发任何钩子, 文件还是黄,
+                    # 只能靠 transcript 尾部解除: 尾部还是那条没回结果的 tool_use = 还堵在你这儿, 保持黄;
+                    # 一旦工具结果回来了(尾部变成 user 记录) = 你已经批了、AI 又在跑 -> 绿。
+                    # 这是"尾部变没变"的单调判断, 不是时间窗 —— 旧的 5 秒心跳窗只要被 3 秒轮询错过一次,
+                    # 黄灯就再也翻不回来, 一直黄到回合结束(这就是黄灯显得特别久的原因)。
+                    if state == "gen":
+                        new = "green"
+                    elif state == "idle":
+                        new = "red"
+                    # tool / unknown -> 保持黄(真的还在等你)
+                # old == "red": Stop/SessionEnd 写的 = 回合结束, 认它
+                if new != old:
                     info = dict(info)
-                    info["status"] = "red"
-                    info["summary"] = info["task"] = retint_suffix(
-                        info.get("summary") or info.get("task") or "", "red")
-                # 否则保持文件里的绿(AI 在思考/运行)
-            elif info.get("status") == "red":
-                # 文件红 = Stop / SessionEnd 写的 = 完成 或 空闲搁置 -> 红。
-                pass
-            elif _transcript_fresh(info.get("_transcript")):
-                # 文件是 yellow(权限/需抉择)但 transcript 近 CLAUDE_FRESH_SEC 秒动过 = 你已批准、AI 又在跑。
-                # 批准权限不触发 UserPromptSubmit 写绿, 文件仍是 yellow; 靠心跳把它顶成绿, 别卡在黄。
-                info = dict(info)
-                info["status"] = "green"
-                info["summary"] = info["task"] = retint_suffix(
-                    info.get("summary") or info.get("_topic") or info["task"], "green")
-            # else: 文件 yellow 且 transcript 没在动 -> 保持 yellow(需你抉择 / 卡住)
+                    info["status"] = new
+                    core = retint_suffix(
+                        info.get("summary") or info.get("task") or info.get("_topic") or "", new)
+                    if state == "interrupted" and core.endswith("已完成"):
+                        core = core[:-3] + "已中断"   # 中断≠完成, 用"已中断"更贴切
+                    info["summary"] = info["task"] = core
             infos.append((p, info))
         self.infos = infos
 
