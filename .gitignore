@@ -9,6 +9,9 @@ standup_ui.json
 notes.txt
 widget.log
 
+# 私人词表 (公司黑话/产品代号/项目显示名) —— 见 rules.example.json
+rules.local.json
+
 # 打包产物
 build/
 dist/

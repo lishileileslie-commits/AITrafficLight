@@ -19,12 +19,6 @@ import re
 import sys
 
 
-DEFAULT_TASK = {
-    "green": "正在处理",
-    "yellow": "待你处理",
-    "red": "空闲",
-}
-
 SUMMARY_MAX_CHARS = 13
 
 # 状态后缀(各 3 字): 永远保留, 先扣掉它再给核心短语分配字数, 绝不被截断。
@@ -38,9 +32,9 @@ LEAD_WORDS = (
 )
 
 # 命中即用"概括词"当摘要 —— 一律不回显用户原话。按顺序取第一个命中。
+# 想加自己的类目(公司/产品/私人项目的黑话), 别改这里: 放到 rules.local.json, 见下面 _load_local()。
 ACTION_PATTERNS = (
     (r"弹窗|弹出|多个网页|noopener|递归|window\.open|isTrusted|popup", "弹窗修复"),
-    (r"妙搭|Miaoda|aiforce|release|发布轮询", "妙搭发布"),
     (r"工作流|workflow", "工作流修复"),
     (r"部署|发布|上线|deploy|firebase|hosting", "发布上线"),
     (r"git|提交|commit|推送|push|拉取|pull|克隆|clone|仓库|版本库|代码库|库已更新", "代码提交"),
@@ -56,6 +50,36 @@ ACTION_PATTERNS = (
     (r"整理|归纳|汇总|归档", "资料整理"),
     (r"写|生成|创建|新建|做一个|做个|加个|加一个", "内容生成"),
 )
+
+
+def _data_dir():
+    """打包版落 LOCALAPPDATA, 源码版就在仓库里 (与 app.py 同一份规则)。"""
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                            "AITrafficLight")
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_local():
+    """可选的私人词表 rules.local.json (不进版本库) —— 公司黑话、产品代号、项目显示名放这儿。
+    这些东西写死在源码里是要出事的: 开源之后, 你的产品名和在做什么, 全世界都看得见。
+
+    格式:
+      {"actions": [["<你的产品代号>|<内部黑话>", "发版跟进"]],   // 优先于内置类目
+       "labels":  {"my-repo": "我的项目"}}                     // 项目文件夹名 -> 卡片显示名
+    """
+    try:
+        with open(os.path.join(_data_dir(), "rules.local.json"), "r", encoding="utf-8-sig") as f:
+            d = json.load(f)
+        acts = tuple((str(p), str(l)) for p, l in d.get("actions", []))
+        labels = {str(k): str(v) for k, v in (d.get("labels") or {}).items()}
+        return acts, labels
+    except Exception:
+        return (), {}
+
+
+LOCAL_ACTIONS, LOCAL_LABELS = _load_local()
+ACTION_PATTERNS = LOCAL_ACTIONS + ACTION_PATTERNS      # 私人类目先命中
 
 # 没命中类目时, 从话题里剥掉"提问脚手架/客套", 抽出核心对象短语当概括。
 # 话首要剥的: 疑问词 + 客套 + "做成/改成…"这类壳动词。
@@ -142,41 +166,32 @@ def first_clause(prompt):
 
 
 def project_label(cwd):
+    """卡片上的项目名。默认就用文件夹名; 想改显示名放 rules.local.json 的 labels。"""
     name = os.path.basename(os.path.normpath(cwd or "")) or "当前项目"
-    known = {
-        "amazon": "Amazon",
-        "104": "104",
-        "AITrafficLight": "AI红绿灯",
-        "upet-recall": "UPet Recall",
-    }
-    return known.get(name, name)
+    return LOCAL_LABELS.get(name, name)
 
 
-def make_summary(cwd, topic, prompt, status):
-    """13 字以内的"概括" —— 描述在干的活, 绝不照抄用户原话: 命中类目取概括词,
-    没命中就用项目名兜底成"XX任务"。末尾恒定接状态后缀(处理中/待确认/已完成)且保证不被截断。"""
-    suffix = STATE_SUFFIX.get(status, "处理中")
-    budget = SUMMARY_MAX_CHARS - len(suffix)          # 先给后缀留位, 剩下的才给核心短语
+def make_core(cwd, topic, prompt):
+    """把"在干的活"提炼成一个短概括词, 绝不照抄用户原话: 命中类目取概括词, 没命中就试着
+    从话题里抽核心对象, 再不行用项目名兜底成"XX任务"。这是唯一会落盘的语义内容。"""
+    budget = SUMMARY_MAX_CHARS - 3                    # 后缀恒为 3 字, 先给它留位
     # 类目匹配扫"整句"(prompt 全文 + 主题), 关键词落在逗号后面也能命中; 类目产出的是概括词, 不会回显。
     haystack = (prompt or "") + " " + (topic or "")
-    core = ""
     for pattern, label in ACTION_PATTERNS:
         if re.search(pattern, haystack, re.IGNORECASE):
-            core = label
-            break
-    if not core:                                      # 没命中类目: 先试着从话题里抽核心对象("工作树"/"头程计算器")
-        obj = distill_topic(topic)
-        # 干净的短对象短语(装得下、结尾不是疑问语气)就用它当概括; 否则(接近整句/带疑问尾)
-        # 退回"项目名+任务", 绝不把用户整句截断回显。
-        if obj and len(obj) <= budget and obj[-1] not in "吗呢吧么？?":
-            core = obj
-        else:
-            core = project_label(cwd) + "任务"
-    return clip(clip(core, budget) + suffix, SUMMARY_MAX_CHARS)
+            return label
+    obj = distill_topic(topic)                        # 没命中类目: 抽核心对象("工作树"/"头程计算器")
+    # 干净的短对象短语(装得下、结尾不是疑问语气)就用它当概括; 否则(接近整句/带疑问尾)
+    # 退回"项目名+任务", 绝不把用户整句截断回显。
+    if obj and len(obj) <= budget and obj[-1] not in "吗呢吧么？?":
+        return obj
+    return project_label(cwd) + "任务"
 
 
-def make_task(topic, summary, status):
-    return clip(summary or DEFAULT_TASK.get(status, "正在处理"), SUMMARY_MAX_CHARS)
+def make_summary(core, status):
+    """概括词 + 状态后缀(处理中/待确认/已完成), 后缀保证不被截断。"""
+    suffix = STATE_SUFFIX.get(status, "处理中")
+    return clip(clip(core, SUMMARY_MAX_CHARS - len(suffix)) + suffix, SUMMARY_MAX_CHARS)
 
 
 def transcript_title(tpath):
@@ -195,6 +210,44 @@ def transcript_title(tpath):
     except Exception:
         pass
     return ""
+
+
+def rel_home(path):
+    """transcript 的绝对路径里带着用户名 (C:\\Users\\<你>\\...)。这个文件会落进别人的项目根目录,
+    所以存成 "~/..." 的相对形式; app.py 读的时候再展开。不在 home 底下的路径原样留着。"""
+    try:
+        home = os.path.expanduser("~")
+        ap = os.path.abspath(path)
+        if os.path.commonpath([ap, home]) == home:
+            return "~/" + os.path.relpath(ap, home).replace("\\", "/")
+    except Exception:
+        pass
+    return path
+
+
+def git_exclude(cwd):
+    """把 .ai-status.json 写进本仓库的 .git/info/exclude。
+
+    这是每个克隆各自的本地忽略清单: 既不进版本库、也不弄脏对方自己维护的 .gitignore,
+    但能保证这个状态文件不会被 `git add .` 顺手提交上去 —— 别人装了这个工具, 不该因此
+    在自己的 PR 里带出一个记着"他刚让 AI 干了啥"的文件。
+    """
+    git = os.path.join(cwd, ".git")
+    if not os.path.isdir(git):                         # 没有 .git / 是 worktree 的 .git 文件 -> 不管
+        return
+    ex = os.path.join(git, "info", "exclude")
+    try:
+        cur = ""
+        if os.path.exists(ex):
+            with open(ex, "r", encoding="utf-8", errors="replace") as f:
+                cur = f.read()
+        if ".ai-status.json" in cur:
+            return
+        os.makedirs(os.path.dirname(ex), exist_ok=True)
+        with open(ex, "a", encoding="utf-8") as f:
+            f.write("\n# AI 红绿灯的本地状态文件, 不进版本库\n.ai-status.json\n")
+    except Exception:
+        pass
 
 
 def main():
@@ -221,7 +274,8 @@ def main():
     except Exception:
         pass
 
-    tpath = data.get("transcript_path") or old.get("_transcript", "")
+    # 旧文件里存的是 "~/..." 相对形式 (见 rel_home), 读回来要展开
+    tpath = data.get("transcript_path") or os.path.expanduser(old.get("_transcript", ""))
     prompt = data.get("prompt", "")
     if str(prompt).lstrip().startswith("<task-notification>"):
         sys.exit(0)
@@ -237,20 +291,24 @@ def main():
         if nt and (has_work_signal(nt) or not topic):
             topic = nt
 
-    summary = make_summary(cwd, topic, prompt, status)
-    task = make_task(topic, summary, status)
+    # 这个文件落在别人的项目根目录里, 随时可能被 git add . 提交上去 —— 所以里面只许留
+    # "已经提炼过的概括词", 绝不留用户原话。topic 在内存里可以是原句(用来提炼), 但存的是 core。
+    core = make_core(cwd, topic, prompt)
+    summary = make_summary(core, status)
     out = {
         "status": status,
-        "task": task,
+        "task": clip(summary, SUMMARY_MAX_CHARS),
         "summary": summary,
-        "_topic": topic,
+        "_topic": core,
     }
 
     if tpath:
-        out["_transcript"] = tpath
+        out["_transcript"] = rel_home(tpath)           # 绝对路径里带用户名, 存成 ~/ 相对形式
 
     if isinstance(old.get("buttons"), list):
         out["buttons"] = old["buttons"]
+
+    git_exclude(cwd)                                   # 免得它被误提交进别人的版本库
 
     try:
         with open(fp, "w", encoding="utf-8") as f:

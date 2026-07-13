@@ -523,7 +523,7 @@ def _msg_text(msg):
 def transcript_state(tpath):
     """读 transcript 尾部, 判断"球在谁手里" —— 这才是灯色的真信号。
     mtime 不是: 一条跑十分钟的命令期间 transcript 一个字节都不写, 拿"多久没动"判空闲, 必然把
-    正在跑长命令的会话误判成红 (amazon 就是这么被打红的)。尾部那条消息则永远是准的:
+    正在跑长命令的会话误判成红。尾部那条消息则永远是准的:
 
       "ask"  尾部挂着 WAIT_TOOLS 里的 tool_use (AI 在问你 / 等你批计划) = 球在你手里 -> 黄。
              这类工具不发 Notification 钩子, 只能从工具名认。
@@ -632,7 +632,9 @@ def read_status(path):
         info["task"] = str(raw.get("task", "")).strip()
         info["summary"] = str(raw.get("summary", "")).strip()
         info["_topic"] = str(raw.get("_topic", "")).strip()
-        info["_transcript"] = str(raw.get("_transcript", "")).strip()
+        # 状态文件里存的是 "~/..." 相对形式(绝对路径带用户名, 那文件可能被提交进版本库), 这里展开。
+        # 老文件存的是绝对路径, expanduser 原样返回, 兼容。
+        info["_transcript"] = os.path.expanduser(str(raw.get("_transcript", "")).strip())
         btns = raw.get("buttons", [])
         if isinstance(btns, list):
             for b in btns:
@@ -1393,7 +1395,7 @@ class FloatingWidget:
                 # Codex 正在这棵树上跑 = 绿, 与文件里残留的 red/yellow 无关。
                 # codex_active() 已保证 rollout 在 CODEX_FRESH_SEC 内动过(= 真的在干活),
                 # 所以不能再要求"文件本身是绿"—— 否则某项目上一次是 Claude 干的、Stop 写了红,
-                # 之后换 Codex 来跑, 灯就永远卡在红(104 就是这样)。Codex 无钩子写文件, 只能靠心跳。
+                # 之后换 Codex 来跑, 灯就永远卡在红。Codex 无钩子写文件, 只能靠心跳。
                 info = dict(info)
                 info["status"] = "green"
                 # 用 Codex 会话的智能标题(thread_name)当卡片文字 —— 它描述 Codex 正在干的活。
