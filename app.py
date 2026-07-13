@@ -36,7 +36,7 @@ CLAUDE_IDLE_GRACE_SEC = 30  # 尾部=回合已结束、文件却还写着绿(Sto
                             # 留余量是因为回合中途 assistant 常先写一条文本、隔几秒才写 tool_use, 那个缝隙
                             # 里尾部看着就像"回合结束", 别闪红。
 CLAUDE_BUSY_MAX_SEC = 1800  # 尾部=该 AI 动(工具在跑/正在生成)却这么久没写过一个字节 = 会话被杀/窗口被关,
-                            # 没有任何钩子会响 -> 落红, 免得永久绿。
+                            # 没有任何钩子会响 -> 转黄(它没干完, 判红=撒谎说"已完成"), 免得永久绿。
 CLAUDE_STALE_SEC = 600      # 尾部读不出来(unknown)时才用的 mtime 兜底。
 
 CREATE_NO_WINDOW = 0x08000000
@@ -74,6 +74,13 @@ TEXT_W = CARD_W - TEXT_X - 14
 # 右侧按钮 (常用指令) —— 单行排列, 按标签自适应宽度
 BTN_H, BTN_GAP, BTN_PAD_X, BTN_PT = 19, 6, 11, 9
 BTN_ZONE_PAD, BTN_ZONE_RPAD = 12, 12
+
+# 贴边收起 (拖到屏幕上/下/左/右边缘 -> 缩进去, 只留一条彩色细边)
+DOCK_STRIP = 4                 # 收起后露出的细边厚度 (逻辑 px)
+DOCK_SNAP = 16                 # 松手时离边多近算吸附 (逻辑 px)
+DOCK_HOT = 8                   # 细边命中区外扩余量: 细边可以很细, 但要好碰 —— 命中区比它宽
+DOCK_MS, DOCK_STEPS = 110, 9   # 滑出/滑回动画时长与帧数
+STRIP_ALPHA = 235              # 细边不透明度: 不跟随透明度滑块, 收起了也要看得清
 
 # ---------------------------------------------------------------------------
 # UpTime 计时器 + 备注 (原 standup.py, 现合并进同一磨砂玻璃窗口)
@@ -457,6 +464,13 @@ SKIP_RECORDS = ("system", "attachment", "file-history-snapshot",
                 "last-prompt", "ai-title", "queue-operation", "summary")
 TAIL_BYTES = 262144                   # 只读尾部 256KB: 够装下最后几条记录(含大 tool_result), 又不整文件读
 
+# 这几个工具的"结果"只能由人给出 —— 挂在这儿就等于球在你手里, 该黄。
+# 不能靠 Notification 钩子认它们: AI 提问(AskUserQuestion)/等你批计划(ExitPlanMode) 时
+# Claude Code 根本不发 Notification, 钩子不响, 文件还停在 UserPromptSubmit 写的绿 ——
+# 于是"AI 在等你回答"却一路绿灯, 正是要红绿灯解决的那个场景反而漏了。工具名在 transcript
+# 尾部写得明明白白, 认它比认钩子可靠。
+WAIT_TOOLS = {"AskUserQuestion", "ExitPlanMode"}
+
 
 def _blocks(msg):
     """消息里的内容块类型集合, 如 {"text", "tool_use", "thinking", "tool_result"}。"""
@@ -471,6 +485,15 @@ def _blocks(msg):
     elif c:
         out.add("text")
     return out
+
+
+def _tool_names(msg):
+    """这条 assistant 记录里发起的工具名集合。"""
+    c = msg.get("content")
+    if not isinstance(c, list):
+        return set()
+    return {str(x.get("name") or "") for x in c
+            if isinstance(x, dict) and x.get("type") == "tool_use"}
 
 
 def _msg_text(msg):
@@ -491,7 +514,14 @@ def transcript_state(tpath):
     mtime 不是: 一条跑十分钟的命令期间 transcript 一个字节都不写, 拿"多久没动"判空闲, 必然把
     正在跑长命令的会话误判成红 (amazon 就是这么被打红的)。尾部那条消息则永远是准的:
 
-      "tool" AI 发了 tool_use 但还没有结果回来。两种可能, transcript 里长得一模一样, 靠文件灯色分:
+      "ask"  尾部挂着 WAIT_TOOLS 里的 tool_use (AI 在问你 / 等你批计划) = 球在你手里 -> 黄。
+             这类工具不发 Notification 钩子, 只能从工具名认。
+      "error" 尾部是带 isApiErrorMessage 的 assistant 记录 (掉线 / 认证失败 / 限额) = AI 不是干完了,
+             是死在半路, 你不重试它就永远不动 -> 黄。注意它长得跟正常收尾一模一样(assistant + 纯文本),
+             不认这个标记就会被当成 "idle" 判红 = "已完成", 而你根本不知道它其实崩了。
+             重试中的瞬时报错不在这儿: 那是 type=system/subtype=api_error, 已被 SKIP_RECORDS 跳过,
+             不该因为一次自动重试就点黄灯。
+      "tool" AI 发了别的 tool_use 但还没有结果回来。两种可能, transcript 里长得一模一样, 靠文件灯色分:
              文件绿 = 工具正在跑 (跑多久都算在干活); 文件黄 = Notification 说要你批准, 还堵在你这儿。
       "gen"  尾部是 user 记录 (你的话, 或工具结果回来了) = 球在 AI 手里, 它正在生成。
       "idle" 尾部是 assistant 纯文本 = 回合已结束, 球在你手里。(只含 thinking 的记录不算结束:
@@ -525,8 +555,12 @@ def transcript_state(tpath):
         if not isinstance(msg, dict):
             continue
         if d.get("type") == "assistant":
+            if d.get("isApiErrorMessage"):
+                return "error"             # 报错落到尾部 = 这轮真的死了 (见下面 "error" 说明)
             blocks = _blocks(msg)
             if "tool_use" in blocks:
+                if _tool_names(msg) & WAIT_TOOLS:
+                    return "ask"           # AI 在等你回答/等你批计划 -> 球在你手里
                 return "tool"
             if "text" in blocks:
                 return "idle"
@@ -712,6 +746,17 @@ class Renderer:
         w = round((cw + 2 * MARGIN) * self.ui)
         h = round(total * self.ui)
         return w, h
+
+    def render_strip(self, size, status):
+        """收起后贴边的那条细边: 一颗拉长的灯, 颜色 = 最紧急的状态。
+        贴边那一侧的圆角会被屏幕边缘裁掉, 看上去就是从边上探出来的半颗胶囊。"""
+        w, h = size
+        img = Image.new("RGBA", (w * S, h * S), (0, 0, 0, 0))
+        col = dict(LAMPS).get(status, C_RED)
+        r = min(w, h) * S / 2.0
+        ImageDraw.Draw(img).rounded_rectangle(
+            [0, 0, w * S - 1, h * S - 1], radius=r, fill=col + (STRIP_ALPHA,))
+        return img.resize((w, h), Image.LANCZOS)
 
     # ---- UpTime 卡片布局 / 度量 ----
     def _wrap(self, text, lat, cjk, maxw_logical):
@@ -1103,6 +1148,11 @@ class RECT(ctypes.Structure):
                 ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
 
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", RECT),
+                ("rcWork", RECT), ("dwFlags", wintypes.DWORD)]
+
+
 class BLENDFUNCTION(ctypes.Structure):
     _fields_ = [("BlendOp", ctypes.c_byte), ("BlendFlags", ctypes.c_byte),
                 ("SourceConstantAlpha", ctypes.c_byte), ("AlphaFormat", ctypes.c_byte)]
@@ -1160,6 +1210,11 @@ user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.SetCapture.restype = wintypes.HWND
 user32.SetCapture.argtypes = [wintypes.HWND]
 user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+# 贴边收起: 取窗口所在显示器的工作区 (排除任务栏, 所以贴底边不会被任务栏盖住)
+MONITOR_DEFAULTTONEAREST = 2
+user32.MonitorFromWindow.restype = wintypes.HANDLE
+user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFO)]
 # 窗口枚举/切前台 (点击卡片聚焦对应 VSCode 窗口)
 user32.IsWindowVisible.argtypes = [wintypes.HWND]
 user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
@@ -1259,6 +1314,11 @@ class FloatingWidget:
             self.ui_data["running_start"] = None
         self.pos = _clamp_onscreen(self.ui_data.get("x", 80),
                                    self.ui_data.get("y", 80), 300, 480)
+        # 贴边收起: dock = 停靠的边 (None=没贴边); peeked = 当前是否滑出来了。
+        # 重启后一律以"收起"状态回来 —— 贴过边的人要的就是桌面干净。
+        dk = self.ui_data.get("dock")
+        self.dock = dk if dk in ("left", "right", "top", "bottom") else None
+        self.peeked = False
 
         self._wndproc = WNDPROCTYPE(self._on_msg)
         self._edit_wndproc = WNDPROCTYPE(self._edit_proc)
@@ -1329,13 +1389,18 @@ class FloatingWidget:
                 state = transcript_state(tpath)
                 age = _transcript_age(tpath)
                 new = old
-                if state == "interrupted":
-                    new = "red"                       # 按了 Esc: 不触发任何钩子, 文件还停在绿, 只能认这个标记
+                if state in ("ask", "error"):
+                    # AI 停下来了, 而且不是它自己能解决的: 在等你回答 / 崩在半路。
+                    # 这两种都不发 Notification 钩子, 指望钩子必漏 -> 只认 transcript 尾部。
+                    new = "yellow"
+                elif state == "interrupted":
+                    new = "red"                       # 按了 Esc: 你自己叫停的, 不用提醒你 -> 红
                 elif old == "green":
                     if state in ("tool", "gen"):
                         # 尾部说球在 AI 手里(工具在跑 / 正在生成) -> 绿, 不管 transcript 多久没写:
-                        # 长命令期间它本来就不写。只有久到像会话被杀(半小时) 才当崩了落红。
-                        new = "red" if age >= CLAUDE_BUSY_MAX_SEC else "green"
+                        # 长命令期间它本来就不写。久到像会话被杀(半小时)= 进程崩了/窗口被关, 卡在半截
+                        # 再也不会动了 -> 黄(要你去看一眼), 不是红: 它没干完, 判"已完成"是撒谎。
+                        new = "yellow" if age >= CLAUDE_BUSY_MAX_SEC else "green"
                     elif state == "idle":
                         # 尾部说回合已结束, 文件却还绿 = Stop 钩子没响的僵尸绿 -> 落红(留一点缝隙余量)。
                         new = "red" if age >= CLAUDE_IDLE_GRACE_SEC else "green"
@@ -1360,15 +1425,123 @@ class FloatingWidget:
                         info.get("summary") or info.get("task") or info.get("_topic") or "", new)
                     if state == "interrupted" and core.endswith("已完成"):
                         core = core[:-3] + "已中断"   # 中断≠完成, 用"已中断"更贴切
+                    elif state == "error" and core.endswith("待确认"):
+                        core = core[:-3] + "已报错"   # 崩了≠等你拍板, 说清是"它挂了, 你去看看"
                     info["summary"] = info["task"] = core
             infos.append((p, info))
         self.infos = infos
 
-    def _render_now(self):
+    # ---- 贴边收起 ----
+    def _work_area(self):
+        """窗口所在显示器的工作区 (排除任务栏)。取不到就退回主屏。"""
         try:
+            mi = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            hmon = user32.MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST)
+            if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                r = mi.rcWork
+                return r.left, r.top, r.right, r.bottom
+        except Exception:
+            pass
+        gm = user32.GetSystemMetrics
+        return 0, 0, gm(0), gm(1)
+
+    def _strip_t(self):
+        return max(round(DOCK_STRIP * self.ui), 3)
+
+    def _dock_geom(self):
+        """贴边时的三组几何: (滑出后卡片的位置, 细边位置, 细边尺寸)。
+        卡片沿边紧贴, 另一轴沿用 self.pos (夹在工作区内)。"""
+        wl, wt, wr, wb = self._work_area()
+        w, h = self.renderer.phys_size(self.infos, self._up_state(), self._settings_state())
+        t = self._strip_t()
+        x = min(max(self.pos[0], wl), max(wr - w, wl))
+        y = min(max(self.pos[1], wt), max(wb - h, wt))
+        if self.dock == "left":
+            return (wl, y), (wl, y), (t, h)
+        if self.dock == "right":
+            return (wr - w, y), (wr - t, y), (t, h)
+        if self.dock == "top":
+            return (x, wt), (x, wt), (w, t)
+        return (x, wb - h), (x, wb - t), (w, t)      # bottom
+
+    def _hidden_pos(self, cx, cy):
+        """收起状态下"卡片"该在的位置 (整张推到边外, 只剩细边那么多露在屏内)。
+        滑动动画就是在这个位置和 _dock_geom() 的卡片位置之间挪窗口。"""
+        wl, wt, wr, wb = self._work_area()
+        w, h = self.renderer.phys_size(self.infos, self._up_state(), self._settings_state())
+        t = self._strip_t()
+        if self.dock == "left":
+            return wl - w + t, cy
+        if self.dock == "right":
+            return wr - t, cy
+        if self.dock == "top":
+            return cx, wt - h + t
+        return cx, wb - t                             # bottom
+
+    def _dock_edge_at(self, rect):
+        """窗口离哪条边最近; 近到阈值内(或已越过)就返回那条边, 否则 None。"""
+        wl, wt, wr, wb = self._work_area()
+        d = {"left": rect.left - wl, "top": rect.top - wt,
+             "right": wr - rect.right, "bottom": wb - rect.bottom}
+        edge = min(d, key=lambda k: d[k])
+        return edge if d[edge] <= max(round(DOCK_SNAP * self.ui), 8) else None
+
+    def _alert(self):
+        """有项目在等你处理 (黄灯) —— 收起时它会自己滑出来提醒。"""
+        return any(i.get("status") == "yellow" for _, i in self.infos)
+
+    def _worst_status(self):
+        """细边取最紧急的那个状态: 有黄就黄, 否则有绿就绿, 全完事才红。"""
+        ss = [i.get("status") for _, i in self.infos]
+        for s in ("yellow", "green"):
+            if s in ss:
+                return s
+        return "red"
+
+    def _slide(self, x0, y0, x1, y1):
+        """滑动: 位图不重画, 只挪窗口 —— 分层窗口的内容跟着走, 几乎不花开销。"""
+        for i in range(1, DOCK_STEPS + 1):
+            k = 1 - (1 - i / DOCK_STEPS) ** 3         # ease-out
+            user32.SetWindowPos(self.hwnd, None,
+                                round(x0 + (x1 - x0) * k), round(y0 + (y1 - y0) * k),
+                                0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+            time.sleep(DOCK_MS / 1000.0 / DOCK_STEPS)
+
+    def _peek_out(self):
+        self.peeked = True
+        (cx, cy), _, _ = self._dock_geom()
+        hx, hy = self._hidden_pos(cx, cy)
+        self._render_now(pos=(hx, hy))                # 先在边外画好整张卡片, 再滑进来
+        self._slide(hx, hy, cx, cy)
+
+    def _peek_in(self):
+        (cx, cy), _, _ = self._dock_geom()
+        self._slide(cx, cy, *self._hidden_pos(cx, cy))
+        self.peeked = False
+        self.settings_open = False
+        self._render_now()                            # 换成细边
+
+    def _set_dock(self, edge):
+        self.dock = edge
+        self.peeked = bool(edge)                      # 刚吸附: 先贴边亮着, 鼠标移开再收
+        self.ui_data["dock"] = edge
+        self.ui_data["x"], self.ui_data["y"] = self.pos
+        save_json(UI_FILE, self.ui_data)
+        self._render_now()
+
+    def _render_now(self, pos=None):
+        try:
+            if self.dock and not self.peeked:         # 收起: 只画细边
+                _, spos, ssize = self._dock_geom()
+                self.button_rects, self.ctl_rects, self._sliders = [], [], {}
+                self._push(self.renderer.render_strip(ssize, self._worst_status()), spos)
+                return
             img, self.button_rects, self.ctl_rects, self._sliders = \
                 self.renderer.render(self.infos, self._up_state(), self._settings_state())
-            self._push(img)
+            if pos is None and self.dock and not self._down:
+                pos = self._dock_geom()[0]            # 贴着边站好 (拖动中不干预)
+            self._push(img, pos)
         except Exception as e:
             import traceback
             log("render error: " + repr(e) + "\n" + traceback.format_exc())
@@ -1378,7 +1551,7 @@ class FloatingWidget:
                 "scale": self.user_scale, "dragging": self._slider_drag is not None,
                 "presets": self.presets}
 
-    def _push(self, img):
+    def _push(self, img, pos=None):
         w, h = img.size
         data = premultiplied_bgra(img)
         screen = user32.GetDC(None)
@@ -1397,9 +1570,11 @@ class FloatingWidget:
         old = gdi32.SelectObject(memdc, hbmp)
         ctypes.memmove(bits, data, len(data))
 
-        rect = RECT()
-        user32.GetWindowRect(self.hwnd, ctypes.byref(rect))
-        ptdst = POINT(rect.left, rect.top)
+        if pos is None:                               # 不指定就原地更新 (UpdateLayeredWindow 会顺带改尺寸)
+            rect = RECT()
+            user32.GetWindowRect(self.hwnd, ctypes.byref(rect))
+            pos = (rect.left, rect.top)
+        ptdst = POINT(pos[0], pos[1])
         size = SIZE(w, h)
         ptsrc = POINT(0, 0)
         blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
@@ -1485,8 +1660,9 @@ class FloatingWidget:
         self._render_now()
 
     def _hover_poll(self):
-        """右下角小热区: 鼠标移入 -> 展开设置面板; 移出窗口 -> 收起。拖滑块/编辑备注时不动。"""
-        if self._slider_drag or self._note_editor:
+        """两件事: 贴边时鼠标碰细边(或来了黄灯) -> 滑出, 离开且没黄灯 -> 滑回;
+        没贴边时, 右下角小热区 -> 展开设置面板, 移出窗口 -> 收起。拖滑块/拖窗/编辑备注时不动。"""
+        if self._slider_drag or self._note_editor or self._down:
             return
         try:
             sx, sy = self._cursor()
@@ -1494,6 +1670,19 @@ class FloatingWidget:
             user32.GetWindowRect(self.hwnd, ctypes.byref(rect))
         except Exception:
             return
+        if self.dock:
+            m = DOCK_HOT * self.ui
+            near = (rect.left - m <= sx <= rect.right + m and
+                    rect.top - m <= sy <= rect.bottom + m)
+            want = near or self._alert()             # 黄灯 = 有事找你, 自己滑出来
+            if want and not self.peeked:
+                self._peek_out()
+                return
+            if not want and self.peeked:
+                self._peek_in()
+                return
+            if not self.peeked:                      # 收着的细边上没有设置面板
+                return
         if self.settings_open:
             m = 6 * self.ui
             inside = (rect.left - m <= sx <= rect.right + m and
@@ -1529,6 +1718,9 @@ class FloatingWidget:
         if msg == WM_LBUTTONDOWN:
             if self._note_editor:                    # 编辑中点玻璃 -> 先提交关闭
                 self._close_note_editor(cancel=False)
+                return 0
+            if self.dock and not self.peeked:        # 手快, 抢在悬停轮询之前点到细边 -> 先滑出来
+                self._peek_out()
                 return 0
             cxp, cyp = self._client_xy(lparam)
             sk = self._slider_at(cxp, cyp)           # 先判设置滑块
@@ -1579,9 +1771,11 @@ class FloatingWidget:
             user32.ReleaseCapture()
             down = self._down
             self._down = None
-            if self._dragging:                       # 拖动结束 -> 记住位置
-                self.ui_data["x"], self.ui_data["y"] = self.pos
-                save_json(UI_FILE, self.ui_data)
+            if self._dragging:                       # 拖动结束 -> 记住位置; 落在边上就吸附收起
+                rect = RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                self.pos = (rect.left, rect.top)
+                self._set_dock(self._dock_edge_at(rect))
                 return 0
             cxp, cyp = down[4], down[5]
             kind = self._ctl_at(cxp, cyp)            # 先判 UpTime 控件
