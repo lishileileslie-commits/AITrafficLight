@@ -1137,6 +1137,7 @@ SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x0001, 0x0004, 0x0010
 
 # 托盘图标 (右键退出 —— 否则这东西只能去任务管理器杀, 发给别人用说不过去)
 WM_TRAY = 0x8000 + 2           # 自定义: 托盘回调
+WM_REVEAL = 0x8000 + 3         # 自定义: 已在运行时又被双击 -> 把窗口亮出来
 WM_COMMAND = 0x0111
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
@@ -1959,6 +1960,9 @@ class FloatingWidget:
                 self._gather_infos()
                 self._render_now()
             return 0
+        if msg == WM_REVEAL:                         # 第二次双击(被单实例锁挡回去的那个)转达过来的
+            self._reveal()
+            return 0
         if msg == WM_TRAY:                           # 托盘: 左键=显示, 右键=菜单
             low = lparam & 0xFFFF
             if low == WM_LBUTTONUP:
@@ -2108,10 +2112,23 @@ class FloatingWidget:
 
 
 def _single_instance():
-    """已在运行则返回 True (防止开机自启与手动启动叠加多个窗口)。"""
+    """已在运行则返回 True (防止开机自启与手动启动叠加多个窗口)。
+
+    但"一声不响地退出"会让人以为双击没反应 —— 尤其窗口正贴边收着、或者被别的窗口盖住时。
+    所以退出前先把消息转达给已经在跑的那个: 让它把自己亮出来。这才是用户双击的本意。
+    """
     k32 = ctypes.windll.kernel32
     k32.CreateMutexW(None, False, "AITrafficLight_Singleton_Mutex")
-    return k32.GetLastError() == 183   # ERROR_ALREADY_EXISTS
+    if k32.GetLastError() != 183:      # ERROR_ALREADY_EXISTS
+        return False
+    try:
+        user32.FindWindowW.restype = wintypes.HWND
+        hwnd = user32.FindWindowW("AITrafficLightWnd", None)
+        if hwnd:
+            user32.PostMessageW(hwnd, WM_REVEAL, 0, 0)
+    except Exception:
+        pass
+    return True
 
 
 if __name__ == "__main__":
