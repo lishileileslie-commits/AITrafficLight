@@ -1135,6 +1135,16 @@ WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN = 0x0201, 0x0202, 0x0204
 MK_LBUTTON = 0x0001
 SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE = 0x0001, 0x0004, 0x0010
 
+# 托盘图标 (右键退出 —— 否则这东西只能去任务管理器杀, 发给别人用说不过去)
+WM_TRAY = 0x8000 + 2           # 自定义: 托盘回调
+WM_COMMAND = 0x0111
+NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
+NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x01, 0x02, 0x04
+IMAGE_ICON, LR_LOADFROMFILE, LR_DEFAULTSIZE = 1, 0x0010, 0x0040
+MF_STRING, MF_SEPARATOR = 0x0000, 0x0800
+TPM_RIGHTBUTTON, TPM_RETURNCMD = 0x0002, 0x0100
+IDM_SHOW, IDM_EXIT = 1001, 1002
+
 # 备注就地编辑 (临时置顶 EDIT 弹窗)
 WM_SETFONT = 0x0030
 WM_KILLFOCUS = 0x0008
@@ -1159,6 +1169,17 @@ class SIZE(ctypes.Structure):
 class RECT(ctypes.Structure):
     _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
                 ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("hWnd", wintypes.HWND),
+                ("uID", ctypes.c_uint), ("uFlags", ctypes.c_uint),
+                ("uCallbackMessage", ctypes.c_uint), ("hIcon", wintypes.HICON),
+                ("szTip", ctypes.c_wchar * 128),
+                ("dwState", wintypes.DWORD), ("dwStateMask", wintypes.DWORD),
+                ("szInfo", ctypes.c_wchar * 256), ("uVersion", ctypes.c_uint),
+                ("szInfoTitle", ctypes.c_wchar * 64), ("dwInfoFlags", wintypes.DWORD),
+                ("guidItem", ctypes.c_byte * 16), ("hBalloonIcon", wintypes.HICON)]
 
 
 class MONITORINFO(ctypes.Structure):
@@ -1223,6 +1244,20 @@ user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.SetCapture.restype = wintypes.HWND
 user32.SetCapture.argtypes = [wintypes.HWND]
 user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+# 托盘
+shell32 = ctypes.windll.shell32
+shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+user32.LoadImageW.restype = wintypes.HANDLE
+user32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR, ctypes.c_uint,
+                              ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+user32.CreatePopupMenu.restype = wintypes.HMENU
+user32.AppendMenuW.argtypes = [wintypes.HMENU, ctypes.c_uint, ctypes.c_size_t, wintypes.LPCWSTR]
+user32.TrackPopupMenu.restype = ctypes.c_int
+user32.TrackPopupMenu.argtypes = [wintypes.HMENU, ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_int, wintypes.HWND, ctypes.c_void_p]
+user32.DestroyMenu.argtypes = [wintypes.HMENU]
+user32.DestroyIcon.argtypes = [wintypes.HICON]
 # 贴边收起: 取窗口所在显示器的工作区 (排除任务栏, 所以贴底边不会被任务栏盖住)
 MONITOR_DEFAULTTONEAREST = 2
 user32.MonitorFromWindow.restype = wintypes.HANDLE
@@ -1301,6 +1336,8 @@ class FloatingWidget:
         self._edit_font = None
         self._edit_oldproc = None
         self._poll = 0
+        self._tray_icon = None    # 托盘图标 HICON (换色时销毁旧的)
+        self._tray_status = None
 
         # ---- 计时 / 备注 状态 (原 standup.py, 复用同一批文件, 不清空历史) ----
         self.ui_data = load_json(UI_FILE, {})
@@ -1345,6 +1382,8 @@ class FloatingWidget:
         self.hwnd = self._make_window()
         self._gather_infos()
         self._render_now()
+        self._tray_status = self._worst_status()
+        self._tray(NIM_ADD, self._tray_status)
         user32.SetTimer(self.hwnd, 1, TICK_MS, None)
         user32.SetTimer(self.hwnd, 2, 150, None)       # 悬停轮询: 右下角触发设置面板
         self._loop()
@@ -1450,6 +1489,83 @@ class FloatingWidget:
                     info["summary"] = info["task"] = core
             infos.append((p, info))
         self.infos = infos
+
+    # ---- 托盘图标 (右键退出; 图标颜色 = 最紧急的灯, 窗口收起了也能一眼看出有没有事) ----
+    def _tray_hicon(self, status):
+        """现画一颗灯当图标: 状态色实心圆 + 深色描边(浅色任务栏上也看得清)。"""
+        n, sc = 32, 4
+        img = Image.new("RGBA", (n * sc, n * sc), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        col = dict(LAMPS).get(status, C_RED)
+        pad = 2 * sc
+        d.ellipse([pad, pad, n * sc - pad, n * sc - pad],
+                  fill=col + (255,), outline=(20, 22, 28, 200), width=sc)
+        d.ellipse([n * sc * 0.40, n * sc * 0.40, n * sc * 0.60, n * sc * 0.60],
+                  fill=(255, 255, 255, 235))                # 中心亮点, 和卡片上的灯一个样式
+        img = img.resize((n, n), Image.LANCZOS)
+        path = os.path.join(HERE, "_tray.ico")
+        img.save(path, sizes=[(16, 16), (32, 32)])
+        return user32.LoadImageW(None, path, IMAGE_ICON, 0, 0,
+                                 LR_LOADFROMFILE | LR_DEFAULTSIZE)
+
+    def _tray(self, action, status=None):
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        nid.hWnd = self.hwnd
+        nid.uID = 1
+        if action == NIM_DELETE:
+            shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
+            return
+        old = self._tray_icon
+        self._tray_icon = self._tray_hicon(status)
+        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+        nid.uCallbackMessage = WM_TRAY
+        nid.hIcon = self._tray_icon
+        nid.szTip = "AI 红绿灯 · %s" % {"yellow": "有项目在等你处理",
+                                        "green": "有项目在跑",
+                                        "red": "都空闲了"}.get(status, "")
+        shell32.Shell_NotifyIconW(action, ctypes.byref(nid))
+        if old:
+            user32.DestroyIcon(old)                          # 换了图标就把旧的销毁, 免得句柄泄漏
+
+    def _tray_sync(self):
+        """灯色变了才重画托盘图标 —— 每秒重画既费事又会让托盘闪。"""
+        st = self._worst_status()
+        if st != self._tray_status:
+            self._tray_status = st
+            self._tray(NIM_MODIFY, st)
+
+    def _tray_menu(self):
+        menu = user32.CreatePopupMenu()
+        user32.AppendMenuW(menu, MF_STRING, IDM_SHOW, "显示悬浮窗")
+        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+        user32.AppendMenuW(menu, MF_STRING, IDM_EXIT, "退出")
+        pt = POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
+        user32.SetForegroundWindow(self.hwnd)                # 不抢前台的话, 菜单会点不掉
+        cmd = user32.TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                                    pt.x, pt.y, 0, self.hwnd, None)
+        user32.DestroyMenu(menu)
+        if cmd == IDM_EXIT:
+            self._quit()
+        elif cmd == IDM_SHOW:
+            self._reveal()
+
+    def _reveal(self):
+        """把窗口弄到看得见的地方: 贴边收着就滑出来, 否则拉回屏内并置顶。"""
+        if self.dock and not self.peeked:
+            self._peek_out()
+            return
+        self.pos = _clamp_onscreen(self.pos[0], self.pos[1], 300, 480)
+        user32.SetWindowPos(self.hwnd, None, self.pos[0], self.pos[1], 0, 0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+        self._render_now()
+
+    def _quit(self):
+        if self.running:                                     # 正在计时: 先把这段存进历史再走
+            self._toggle_timer()
+        self._tray(NIM_DELETE)
+        user32.DestroyWindow(self.hwnd)
 
     # ---- 贴边收起 ----
     def _work_area(self):
@@ -1843,6 +1959,17 @@ class FloatingWidget:
                 self._gather_infos()
                 self._render_now()
             return 0
+        if msg == WM_TRAY:                           # 托盘: 左键=显示, 右键=菜单
+            low = lparam & 0xFFFF
+            if low == WM_LBUTTONUP:
+                self._reveal()
+            elif low == 0x0205:                      # WM_RBUTTONUP
+                self._tray_menu()
+            return 0
+        if msg == WM_COMMAND:
+            if (wparam & 0xFFFF) == IDM_EXIT:
+                self._quit()
+            return 0
         if msg == WM_TIMER:
             if wparam == 2:                          # 悬停轮询: 右下角触发/收起设置面板
                 self._hover_poll()
@@ -1852,10 +1979,12 @@ class FloatingWidget:
                 if self._poll % 3 == 0:              # 每 ~3s 重扫项目/Codex
                     self._gather_infos()
                     self._render_now()
+                    self._tray_sync()                # 灯色变了就换托盘图标
                 elif self.running:                   # 其余每秒只为刷新计时
                     self._render_now()
             return 0
         if msg == WM_DESTROY:
+            self._tray(NIM_DELETE)                   # 别在托盘里留一个点不掉的僵尸图标
             user32.PostQuitMessage(0)
             return 0
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)

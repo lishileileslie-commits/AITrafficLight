@@ -8,6 +8,7 @@ standup_log.json
 standup_ui.json
 notes.txt
 widget.log
+_tray.ico
 
 # 私人词表 (公司黑话/产品代号/项目显示名) —— 见 rules.example.json
 rules.local.json
