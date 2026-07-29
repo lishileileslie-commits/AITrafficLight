@@ -92,6 +92,7 @@ DOCK_STRIP = 4                 # 收起后露出的细边厚度 (逻辑 px)
 DOCK_SNAP = 16                 # 松手时离边多近算吸附 (逻辑 px)
 DOCK_HOT = 8                   # 细边命中区外扩余量: 细边可以很细, 但要好碰 —— 命中区比它宽
 DOCK_MS, DOCK_STEPS = 110, 9   # 滑出/滑回动画时长与帧数
+DONE_PEEK_SEC = 5              # 有项目刚跑完(变红): 贴边时滑出来提醒这么多秒, 然后自己收回去
 STRIP_ALPHA = 235              # 细边不透明度: 不跟随透明度滑块, 收起了也要看得清
 
 # ---------------------------------------------------------------------------
@@ -1370,6 +1371,7 @@ class FloatingWidget:
         dk = self.ui_data.get("dock")
         self.dock = dk if dk in ("left", "right", "top", "bottom") else None
         self.peeked = False
+        self._done_peek_until = 0.0                    # 刚跑完的提醒滑出到什么时候为止
 
         # 首次运行把 hook 接进 Claude Code (会弹一次框征求同意); 已接过则静默自愈过时的路径。
         try:
@@ -1423,6 +1425,8 @@ class FloatingWidget:
     # ---- 数据采集 / 渲染 ----
     def _gather_infos(self):
         codex = codex_active()                  # (cwd, 标题) 或 None
+        prev = {p: i.get("status") for p, i in self.infos}   # 上一轮的灯色, 用来抓"刚跑完"
+        quiet = set()                           # 变红了也别打扰你的: 你自己叫停的 / 手动摁的灯
         infos = []
         for p, info in gather():
             if p in self.manual and self.manual_base.get(p) != info.get("status"):
@@ -1431,6 +1435,7 @@ class FloatingWidget:
             if p in self.manual:                # 手动固定的灯: 直接采用
                 info = dict(info)
                 info["status"] = self.manual[p]
+                quiet.add(p)
             elif codex and same_tree(p, codex[0]):
                 # Codex 正在这棵树上跑 = 绿, 与文件里残留的 red/yellow 无关。
                 # codex_active() 已保证 rollout 在 CODEX_FRESH_SEC 内动过(= 真的在干活),
@@ -1455,6 +1460,7 @@ class FloatingWidget:
                     new = "yellow"
                 elif state == "interrupted":
                     new = "red"                       # 按了 Esc: 你自己叫停的, 不用提醒你 -> 红
+                    quiet.add(p)
                 elif old == "green":
                     if state in ("tool", "gen"):
                         # 尾部说球在 AI 手里(工具在跑 / 正在生成) -> 绿, 不管 transcript 多久没写:
@@ -1490,6 +1496,11 @@ class FloatingWidget:
                     info["summary"] = info["task"] = core
             infos.append((p, info))
         self.infos = infos
+        # 刚有项目从"在跑/等你"落到"已完成" -> 贴边收着的话滑出来报个到, 到点自己缩回去。
+        # 红是静息态(闲着就是全红), 所以只认这一下变化, 不能像黄灯那样一直挂着不收。
+        if any(i.get("status") == "red" and prev.get(p) in ("green", "yellow") and p not in quiet
+               for p, i in infos):
+            self._done_peek_until = time.time() + DONE_PEEK_SEC
 
     # ---- 托盘图标 (右键退出; 图标颜色 = 最紧急的灯, 窗口收起了也能一眼看出有没有事) ----
     def _tray_hicon(self, status):
@@ -1797,7 +1808,7 @@ class FloatingWidget:
         self._render_now()
 
     def _hover_poll(self):
-        """两件事: 贴边时鼠标碰细边(或来了黄灯) -> 滑出, 离开且没黄灯 -> 滑回;
+        """两件事: 贴边时鼠标碰细边(或来了黄灯 / 刚有项目跑完) -> 滑出, 条件都不在了 -> 滑回;
         没贴边时, 右下角小热区 -> 展开设置面板, 移出窗口 -> 收起。拖滑块/拖窗/编辑备注时不动。"""
         if self._slider_drag or self._note_editor or self._down:
             return
@@ -1811,7 +1822,8 @@ class FloatingWidget:
             m = DOCK_HOT * self.ui
             near = (rect.left - m <= sx <= rect.right + m and
                     rect.top - m <= sy <= rect.bottom + m)
-            want = near or self._alert()             # 黄灯 = 有事找你, 自己滑出来
+            # 黄灯 = 有事找你, 一直挂着滑出; 刚跑完的红灯只报到几秒, 到点跟着收回去
+            want = near or self._alert() or time.time() < self._done_peek_until
             if want and not self.peeked:
                 self._peek_out()
                 return
